@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Advanced AIR Canvas </title>
+    <style>
+        :root {
+            --bg-color: #000;
+            --neon-blue: #00f3ff;
+            --neon-pink: #ff00ea;
+            --neon-green: #00ff66;
+            --neon-yellow: #ffea00;
+        }
+
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            overflow: hidden; background-color: var(--bg-color);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white; user-select: none; touch-action: none;
+        }
+
+        /* 1. Hardware Accelerated Video Background */
+        #webcam {
+            position: absolute; top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            object-fit: cover; /* Perfectly fills ANY screen automatically */
+            transform: scaleX(-1); /* Mirrors the video like a real mirror */
+            z-index: 1;
+            opacity: 0.6; /* Darkens video slightly so neon ink pops */
+        }
+
+        /* 2. Transparent Drawing Canvas */
+        #main-canvas {
+            position: absolute; top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            z-index: 2; pointer-events: none; /* Let clicks pass through if needed */
+        }
+
+        /* Mobile-friendly UI Overlay */
+        #ui-layer {
+            position: absolute; bottom: 30px; left: 50%;
+            transform: translateX(-50%); z-index: 10;
+            display: flex; flex-wrap: wrap; justify-content: center; gap: 8px;
+            background: rgba(13, 13, 18, 0.85);
+            padding: 12px 20px; border-radius: 30px;
+            border: 1px solid rgba(0, 243, 255, 0.3);
+            backdrop-filter: blur(10px); width: 90%; max-width: 500px;
+        }
+
+        .mode-indicator {
+            display: flex; align-items: center; gap: 6px;
+            font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+            font-weight: bold; color: rgba(255, 255, 255, 0.3);
+            transition: 0.3s ease; padding: 5px;
+        }
+
+        .mode-indicator.active { color: white; text-shadow: 0 0 8px currentColor; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
+
+        #mode-hover.active { color: white; }
+        #mode-draw.active { color: var(--neon-blue); }
+        #mode-erase.active { color: var(--neon-pink); }
+        #mode-grab.active { color: var(--neon-yellow); }
+        #mode-palm.active { color: var(--neon-green); }
+
+        #loading {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #0d0d12; z-index: 100;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            color: var(--neon-blue); font-size: 18px; letter-spacing: 2px; text-align: center; padding: 20px;
+        }
+
+        .spinner {
+            width: 40px; height: 40px; border: 3px solid transparent; border-top: 3px solid var(--neon-blue);
+            border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px;
+        }
+
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading">
+        <div class="spinner"></div>
+        <div id="loading-text">Optimizing AI for your screen...</div>
+    </div>
+
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="main-canvas"></canvas>
+
+    <div id="ui-layer">
+        <div id="mode-hover" class="mode-indicator active"><div class="dot"></div>Hover</div>
+        <div id="mode-draw" class="mode-indicator"><div class="dot"></div>Draw</div>
+        <div id="mode-erase" class="mode-indicator"><div class="dot"></div>Erase</div>
+        <div id="mode-grab" class="mode-indicator"><div class="dot"></div>Grab</div>
+        <div id="mode-palm" class="mode-indicator"><div class="dot"></div>Place</div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('main-canvas');
+        const ctx = canvasElement.getContext('2d');
+
+        // Core App State
+        let currentMode = 'hover'; 
+        let strokes = []; 
+        let currentStroke = null;
+        let selectedStroke = null;
+
+        // Anti-jitter pointer smoothing
+        let smoothX = 0, smoothY = 0;
+        const SMOOTH_FACTOR = 0.35; // Lowered for smoother, less jittery lines
+
+        // Grab transformation variables
+        let grabState = { active: false, startX: 0, startY: 0, startAngle: 0, strokeInitialTx: 0, strokeInitialTy: 0, strokeInitialRot: 0 };
+
+        // Math Helpers
+        const dist = (p1, p2) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
+        const getAngle = (p1, p2) => Math.atan2(p2.y - p1.y, p2.x - p1.x);
+
+        const calculateCenter = (points) => {
+            let cx = 0, cy = 0;
+            points.forEach(p => { cx += p.x; cy += p.y; });
+            return { x: cx / points.length, y: cy / points.length };
+        };
+
+        const getGlobalPoint = (p, stroke) => {
+            let dx = p.x - stroke.center.x, dy = p.y - stroke.center.y;
+            let rx = dx * Math.cos(stroke.rotation) - dy * Math.sin(stroke.rotation);
+            let ry = dx * Math.sin(stroke.rotation) + dy * Math.cos(stroke.rotation);
+            return { x: rx + stroke.center.x + stroke.translation.x, y: ry + stroke.center.y + stroke.translation.y };
+        };
+
+        // --- Viewport Mapping (The Magic Fix for Mobile/Desktop fitting) ---
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function mapCoordinate(lm) {
+            const videoRatio = videoElement.videoWidth / videoElement.videoHeight;
+            const screenRatio = window.innerWidth / window.innerHeight;
+            let renderWidth, renderHeight, offsetX, offsetY;
+
+            // Simulates CSS 'object-fit: cover' mathematics
+            if (screenRatio > videoRatio) {
+                renderWidth = window.innerWidth;
+                renderHeight = window.innerWidth / videoRatio;
+                offsetX = 0;
+                offsetY = -(renderHeight - window.innerHeight) / 2;
+            } else {
+                renderHeight = window.innerHeight;
+                renderWidth = window.innerHeight * videoRatio;
+                offsetX = -(renderWidth - window.innerWidth) / 2;
+                offsetY = 0;
+            }
+
+            // Apply offsets and size limits
+            let screenX = (lm.x * renderWidth) + offsetX;
+            let screenY = (lm.y * renderHeight) + offsetY;
+
+            // Mirror X because our CSS mirrors the video!
+            return { x: window.innerWidth - screenX, y: screenY };
+        }
+
+        // --- Gesture Detection ---
+        function analyzeHand(landmarks) {
+            const pts = landmarks.map(mapCoordinate);
+            
+            // Improved logic: Compares tip distance against the base knuckle (MCP) with a 20% threshold
+            const isUp = (tip, mcp) => dist(pts[0], pts[tip]) > dist(pts[0], pts[mcp]) * 1.2;
+
+            // Checking against the correct base knuckles (5, 9, 13, 17)
+            const idxUp = isUp(8, 5), midUp = isUp(12, 9), ringUp = isUp(16, 13), pinkyUp = isUp(20, 17);
+            const upCount = [idxUp, midUp, ringUp, pinkyUp].filter(Boolean).length;
+            
+            let detectedMode = 'hover';
+            if (upCount === 0) detectedMode = 'grab'; // Closed Fist
+            else if (idxUp && midUp && ringUp && !pinkyUp) detectedMode = 'erase'; // 3 Fingers
+            else if (upCount === 4) detectedMode = 'palm'; // Open Palm
+            else if (idxUp && !midUp && !ringUp && !pinkyUp) detectedMode = 'draw'; // 1 Finger
+            else if (idxUp && midUp && !ringUp && !pinkyUp) detectedMode = 'hover'; // 2 Fingers
+
+            return { mode: detectedMode, pts };
+        }
+
+        function updateUI(mode) {
+            document.querySelectorAll('.mode-indicator').forEach(el => el.classList.remove('active'));
+            document.getElementById(`mode-${mode}`).classList.add('active');
+        }
+
+        // --- Core Application Loop ---
+        function processFrame(results) {
+            // Only clear the drawing canvas. Do NOT draw the video (Saves 80% CPU usage)
+            ctx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            let handData = null;
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                handData = analyzeHand(results.multiHandLandmarks[0]);
+                
+                // Track Index Finger Tip
+                const targetX = handData.pts[8].x;
+                const targetY = handData.pts[8].y;
+                
+                // Snap if far, ease if close (Anti-jitter)
+                if (smoothX === 0 || dist({x: smoothX, y: smoothY}, {x: targetX, y: targetY}) > 150) { 
+                    smoothX = targetX; smoothY = targetY; 
+                } else {
+                    smoothX += (targetX - smoothX) * SMOOTH_FACTOR;
+                    smoothY += (targetY - smoothY) * SMOOTH_FACTOR;
+                }
+                
+                handleLogic(handData);
+            } else {
+                if (currentStroke) finishStroke();
+                grabState.active = false;
+            }
+
+            renderStrokes();
+            if (handData) renderHandFeedback(handData);
+        }
+
+        function handleLogic(handData) {
+            const newMode = handData.mode;
+            
+            if (currentMode !== newMode) {
+                if (currentMode === 'draw') finishStroke();
+                if (currentMode === 'grab') grabState.active = false;
+                currentMode = newMode; updateUI(currentMode);
+            }
+
+            // Point 9 is the middle finger knuckle (stable center of hand)
+            const handCenterX = handData.pts[9].x, handCenterY = handData.pts[9].y;
+            const handAngle = getAngle(handData.pts[0], handData.pts[9]);
+
+            switch (currentMode) {
+                case 'draw':
+                    if (!currentStroke) {
+                        currentStroke = { points: [], color: '#00f3ff', translation: { x: 0, y: 0 }, rotation: 0, center: { x: 0, y: 0 }, selected: false };
+                    }
+                    currentStroke.points.push({ x: smoothX, y: smoothY });
+                    break;
+
+                case 'erase':
+                    const ERASE_RADIUS = 35;
+                    let newStrokes = [];
+                    strokes.forEach(stroke => {
+                        let currentSegment = [];
+                        stroke.points.forEach(p => {
+                            if (dist(getGlobalPoint(p, stroke), { x: smoothX, y: smoothY }) > ERASE_RADIUS) {
+                                currentSegment.push(p);
+                            } else {
+                                if (currentSegment.length > 1) {
+                                    newStrokes.push({ points: currentSegment, color: stroke.color, translation: { ...stroke.translation }, rotation: stroke.rotation, center: { ...stroke.center }, selected: stroke.selected });
+                                }
+                                currentSegment = [];
+                            }
+                        });
+                        if (currentSegment.length > 1) {
+                            newStrokes.push({ points: currentSegment, color: stroke.color, translation: { ...stroke.translation }, rotation: stroke.rotation, center: { ...stroke.center }, selected: stroke.selected });
+                        }
+                    });
+                    strokes = newStrokes;
+                    break;
+
+                case 'grab':
+                    if (!grabState.active) {
+                        let nearest = null; let minDist = 120; 
+                        strokes.forEach(stroke => {
+                            const globalCenter = { x: stroke.center.x + stroke.translation.x, y: stroke.center.y + stroke.translation.y };
+                            const d = dist(globalCenter, { x: handCenterX, y: handCenterY });
+                            if (d < minDist) { minDist = d; nearest = stroke; }
+                        });
+
+                        if (nearest) {
+                            selectedStroke = nearest; nearest.selected = true;
+                            grabState = { active: true, startX: handCenterX, startY: handCenterY, startAngle: handAngle, strokeInitialTx: nearest.translation.x, strokeInitialTy: nearest.translation.y, strokeInitialRot: nearest.rotation };
+                        }
+                    } else if (selectedStroke) {
+                        selectedStroke.translation.x = grabState.strokeInitialTx + (handCenterX - grabState.startX);
+                        selectedStroke.translation.y = grabState.strokeInitialTy + (handCenterY - grabState.startY);
+                        selectedStroke.rotation = grabState.strokeInitialRot + (handAngle - grabState.startAngle);
+                    }
+                    break;
+
+                case 'palm':
+                    if (selectedStroke) { selectedStroke.selected = false; selectedStroke = null; }
+                    grabState.active = false;
+                    break;
+            }
+        }
+
+        function finishStroke() {
+            if (currentStroke && currentStroke.points.length > 2) {
+                currentStroke.center = calculateCenter(currentStroke.points);
+                strokes.push(currentStroke);
+            }
+            currentStroke = null;
+        }
+
+        // --- Fast Render Pipeline ---
+        function renderStrokes() {
+            strokes.forEach(drawStroke);
+            if (currentStroke) drawStroke(currentStroke);
+        }
+
+        function drawStroke(stroke) {
+            if (stroke.points.length === 0) return;
+            ctx.save();
+            if (stroke.center.x !== 0) {
+                ctx.translate(stroke.center.x + stroke.translation.x, stroke.center.y + stroke.translation.y);
+                ctx.rotate(stroke.rotation);
+                ctx.translate(-stroke.center.x, -stroke.center.y);
+            }
+            ctx.beginPath();
+            ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+            for (let i = 1; i < stroke.points.length; i++) ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+            
+            ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            
+            // Fast Fake-Neon Effect (No shadowBlur to prevent mobile lag)
+            const color = stroke.selected ? '#ffea00' : stroke.color;
+            ctx.lineWidth = 14; 
+            ctx.strokeStyle = color + '40'; // 25% opacity glow
+            ctx.stroke();
+
+            ctx.lineWidth = 5; 
+            ctx.strokeStyle = color; // Solid core
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        function renderHandFeedback(handData) {
+            // Draw skeletal tracking points (so you know it's tracking correctly)
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+            handData.pts.forEach((p) => { ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, Math.PI * 2); ctx.fill(); });
+
+            // Render Cursor
+            ctx.beginPath();
+            if (currentMode === 'hover') {
+                ctx.arc(smoothX, smoothY, 8, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)'; ctx.lineWidth = 2; ctx.stroke();
+            } else if (currentMode === 'draw') {
+                ctx.arc(smoothX, smoothY, 6, 0, Math.PI * 2);
+                ctx.fillStyle = '#00f3ff'; ctx.fill();
+            } else if (currentMode === 'erase') {
+                ctx.arc(smoothX, smoothY, 35, 0, Math.PI * 2); 
+                ctx.fillStyle = 'rgba(255, 0, 234, 0.2)'; ctx.strokeStyle = '#ff00ea'; ctx.lineWidth = 2; ctx.fill(); ctx.stroke();
+            } else if (currentMode === 'grab') {
+                ctx.arc(handData.pts[9].x, handData.pts[9].y, 20, 0, Math.PI * 2);
+                ctx.strokeStyle = '#ffea00'; ctx.lineWidth = 3; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
+            } else if (currentMode === 'palm') {
+                ctx.arc(handData.pts[9].x, handData.pts[9].y, 25, 0, Math.PI * 2);
+                ctx.strokeStyle = '#00ff66'; ctx.lineWidth = 3; ctx.stroke();
+            }
+        }
+
+        // --- Start MediaPipe Engine ---
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+        
+        hands.setOptions({ 
+            maxNumHands: 1, 
+            modelComplexity: 1,           // Upgraded accuracy
+            minDetectionConfidence: 0.75, // Stricter thresholds
+            minTrackingConfidence: 0.75   // Stricter thresholds
+        });
+        
+        hands.onResults(processFrame);
+
+        // Fetch the optimal resolution for the device camera
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({ image: videoElement }); },
+            width: 1280, height: 720
+        });
+
+        camera.start().then(() => { document.getElementById('loading').style.display = 'none'; })
+        .catch(err => { 
+            document.getElementById('loading-text').innerText = "Please allow Camera Access.";
+            console.error(err); 
+        });
+
+    </script>
+</body>
+</html>
